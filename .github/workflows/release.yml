@@ -1,0 +1,36 @@
+name: Release Mac app
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Secret scan
+        run: chmod +x scripts/check-secrets.sh && ./scripts/check-secrets.sh
+
+      - name: Build release artifacts
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/build-app.sh
+          ./scripts/make-dmg.sh
+          /usr/bin/ditto -c -k --keepParent dist/Bankirr.app dist/Bankirr.zip
+          cd dist && shasum -a 256 Bankirr.zip > SHA256SUMS
+
+      - name: Upload GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Bankirr.zip
+            dist/Bankirr.dmg
+            dist/SHA256SUMS
+          generate_release_notes: true

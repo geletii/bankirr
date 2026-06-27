@@ -1,0 +1,16 @@
+# SwiftPM / Xcode
+.build/
+.build-arm64/
+.build-x86_64/
+*.xcodeproj
+*.xcworkspace
+
+# Release artifacts
+dist/
+*.dmg
+*.zip
+SHA256SUMS
+
+# OS / editor
+.DS_Store
+.cursor/
