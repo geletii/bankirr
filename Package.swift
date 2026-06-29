@@ -23,7 +23,7 @@ let package = Package(
             ],
             path: "Sources/BankirrStatusBarApp",
             resources: [
-                .copy("Web")
+                .copy("AppIcon.png"),
             ],
             linkerSettings: [
                 .unsafeFlags([

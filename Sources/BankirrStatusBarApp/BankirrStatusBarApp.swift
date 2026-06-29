@@ -319,9 +319,19 @@ struct BankirrStatusBarApp: App {
                 }
             }
             .onAppear {
-                walletStore.handleInitialLaunch()
                 surfaceCoordinator.configure(store: walletStore, updater: updateManager)
-                surfaceCoordinator.startIfNeeded()
+                walletStore.evaluateInitialLaunch()
+                if walletStore.shouldPresentOnboarding {
+                    OnboardingWindowManager.shared.present(
+                        store: walletStore,
+                        coordinator: surfaceCoordinator
+                    ) {
+                        walletStore.dismissOnboarding()
+                        surfaceCoordinator.startIfNeeded()
+                    }
+                } else {
+                    surfaceCoordinator.startIfNeeded()
+                }
             }
         }
         .menuBarExtraAccess(
@@ -331,43 +341,6 @@ struct BankirrStatusBarApp: App {
             surfaceCoordinator.attach(statusItem: statusItem)
         }
         .menuBarExtraStyle(.window)
-    }
-}
-
-@MainActor
-final class OnboardingWindowManager: NSObject, NSWindowDelegate {
-    static let shared = OnboardingWindowManager()
-    private var window: NSWindow?
-
-    func present(store: WalletStore) {
-        if let window {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
-        }
-
-        let onboardingView = InitialOnboardingWindowView(store: store) { [weak self] in
-            self?.close()
-        }
-        let host = NSHostingController(rootView: onboardingView)
-        let window = NSWindow(contentViewController: host)
-        window.title = "Welcome to Bankirr"
-        window.setContentSize(NSSize(width: 430, height: 520))
-        window.styleMask = [.titled, .closable, .miniaturizable]
-        window.center()
-        window.delegate = self
-        window.isReleasedWhenClosed = false
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        self.window = window
-    }
-
-    func close() {
-        window?.close()
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        window = nil
     }
 }
 
@@ -1119,7 +1092,6 @@ final class WalletStore: ObservableObject {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let api = BankirrAPIClient.makeDefault()
-    private let initialOnboardingKey = "bankirr.menuBar.initialOnboardingShown.v1"
     private var didCheckInitialLaunch = false
     private var autoRefreshTask: Task<Void, Never>?
     private var entitlementRefreshTask: Task<Void, Never>?
@@ -1517,13 +1489,23 @@ final class WalletStore: ObservableObject {
             || isAwaitingPortfolioData
     }
 
-    func handleInitialLaunch() {
+    private(set) var shouldPresentOnboarding = false
+
+    func dismissOnboarding() {
+        shouldPresentOnboarding = false
+    }
+
+    /// On a fresh app launch, show onboarding when no wallets are loaded yet.
+    func evaluateInitialLaunch() {
         guard !didCheckInitialLaunch else { return }
         didCheckInitialLaunch = true
         guard wallets.isEmpty else { return }
-        guard !UserDefaults.standard.bool(forKey: initialOnboardingKey) else { return }
-        UserDefaults.standard.set(true, forKey: initialOnboardingKey)
-        OnboardingWindowManager.shared.present(store: self)
+        prepareForOnboarding()
+        shouldPresentOnboarding = true
+    }
+
+    func prepareForOnboarding() {
+        ensureLocalTrialStarted()
     }
 
     var rows: [WalletRowViewModel] {
@@ -1568,39 +1550,47 @@ final class WalletStore: ObservableObject {
     }
 
     func addWallet(name: String?, address: String) {
+        Task { _ = await addWalletAsync(name: name, address: address) }
+    }
+
+    @discardableResult
+    func addWalletAsync(name: String?, address: String) async -> Bool {
         guard hasEntitlementAccess else {
             authMessage = "Trial expired. Subscribe to add wallets."
-            return
+            return false
         }
         let cleanedAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanedAddress.isEmpty else { return }
+        guard !cleanedAddress.isEmpty else { return false }
         let trimmedName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if wallets.contains(where: { $0.address.caseInsensitiveCompare(cleanedAddress) == .orderedSame }) {
-            return
+            authMessage = "This wallet is already added."
+            return false
         }
 
         if let token = authToken() {
-            Task {
-                do {
-                    let created = try await api.addWallet(token: token, address: cleanedAddress, label: trimmedName)
-                    invalidateInFlightPortfolioRefresh()
-                    wallets.append(created)
-                    saveWallets()
-                    pruneOrphanSnapshots()
-                    await refreshWallets(ids: [created.id], manual: true)
-                } catch {
-                    authMessage = error.localizedDescription
-                }
+            do {
+                let created = try await api.addWallet(token: token, address: cleanedAddress, label: trimmedName)
+                invalidateInFlightPortfolioRefresh()
+                wallets.append(created)
+                saveWallets()
+                pruneOrphanSnapshots()
+                await refreshWallets(ids: [created.id], manual: true)
+                authMessage = nil
+                return true
+            } catch {
+                authMessage = error.localizedDescription
+                return false
             }
-            return
         }
 
         invalidateInFlightPortfolioRefresh()
         let newWallet = Wallet(name: trimmedName, address: cleanedAddress)
         wallets.append(newWallet)
         saveWallets()
-        Task { await refreshWallets(ids: [newWallet.id], manual: true) }
+        await refreshWallets(ids: [newWallet.id], manual: true)
+        authMessage = nil
+        return true
     }
 
     func deleteWallets(at offsets: IndexSet) {
@@ -2268,47 +2258,6 @@ struct StatusBarLabelView: View {
     }
 }
 
-struct InitialOnboardingWindowView: View {
-    @ObservedObject var store: WalletStore
-    let onClose: () -> Void
-    @Environment(\.openURL) private var openURL
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            CartoonWelcomeAnimationView()
-                .frame(maxWidth: .infinity)
-
-            Text("Welcome to Bankirr")
-                .font(.title2.bold())
-
-            SubscriptionCTABanner(store: store, openURL: openURL)
-
-            AccountStatusStrip(store: store, openURL: openURL)
-
-            CollapsibleAddWalletFormView(store: store)
-
-            HStack {
-                Button("Later") {
-                    onClose()
-                }
-                .buttonStyle(.bordered)
-
-                Spacer()
-            }
-
-            SupportContactLink()
-
-            BetaVersionNotice()
-        }
-        .padding(16)
-        .onChange(of: store.hasWallets) { hasWallets in
-            if hasWallets {
-                onClose()
-            }
-        }
-    }
-}
-
 struct NetworkSphereIconView: View {
     var radiusScale: CGFloat = 0.44
 
@@ -2326,13 +2275,6 @@ struct NetworkSphereIconView: View {
             }
         }
         .frame(width: 120, height: 120)
-    }
-}
-
-struct CartoonWelcomeAnimationView: View {
-    var body: some View {
-        NetworkSphereIconView()
-            .frame(width: 140, height: 112)
     }
 }
 

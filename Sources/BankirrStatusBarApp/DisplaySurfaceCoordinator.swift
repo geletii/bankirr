@@ -17,6 +17,8 @@ final class DisplaySurfaceCoordinator: ObservableObject {
     static let featureDefaultsKey = "bankirr.notchFeatureEnabled"
     static let displayPreferenceKey = "bankirr.displayPreference"
     static let notchHintIconVisibleKey = "bankirr.notchHintIconVisible"
+    /// Set only when the user explicitly chooses "Hide icon" in notch settings.
+    static let notchHintHiddenByUserKey = "bankirr.notchHintIconHiddenByUser.v1"
     /// Legacy key — was incorrectly tied to menu bar extra visibility.
     static let menuBarIconVisibleKey = "bankirr.menuBarIconVisible"
     static let statusItemAutosaveName = "xyz.bankirr.statusbar.main"
@@ -56,9 +58,11 @@ final class DisplaySurfaceCoordinator: ObservableObject {
     }
 
     func configure(store: WalletStore, updater: UpdateManager) {
+        Self.migrateNotchHintPreferenceIfNeeded()
         self.store = store
         self.updater = updater
         displayPreference = Self.loadPreference()
+        isNotchHintIconVisible = Self.isNotchHintIconVisiblePreference()
     }
 
     func attach(statusItem: NSStatusItem) {
@@ -87,6 +91,28 @@ final class DisplaySurfaceCoordinator: ObservableObject {
         }
     }
 
+    /// Saves preference and applies the surface immediately (e.g. during onboarding setup).
+    func applyDisplayPreferenceFromSetup(_ preference: DisplayPreference) {
+        savePreference(preference)
+
+        switch preference {
+        case .notch:
+            guard canSwitchSurface else { return }
+            if surface == .notch { return }
+            Task { await transition(to: .notch) }
+        case .menuBar:
+            if surface == .menuBar {
+                applyMenuBarOnly(animated: false)
+                return
+            }
+            guard canSwitchSurface else {
+                applyMenuBarOnly(animated: false)
+                return
+            }
+            Task { await transition(to: .menuBar) }
+        }
+    }
+
     func moveToMenuBar() {
         guard canSwitchSurface, surface != .menuBar, !isTransitioning else { return }
         Task { await transition(to: .menuBar) }
@@ -99,6 +125,7 @@ final class DisplaySurfaceCoordinator: ObservableObject {
 
     func showNotchHintIcon() {
         guard surface == .notch else { return }
+        UserDefaults.standard.set(false, forKey: Self.notchHintHiddenByUserKey)
         UserDefaults.standard.set(true, forKey: Self.notchHintIconVisibleKey)
         isNotchHintIconVisible = true
         NotchIslandController.shared.refreshWindowLayout()
@@ -106,6 +133,7 @@ final class DisplaySurfaceCoordinator: ObservableObject {
 
     func hideNotchHintIcon() {
         guard surface == .notch else { return }
+        UserDefaults.standard.set(true, forKey: Self.notchHintHiddenByUserKey)
         UserDefaults.standard.set(false, forKey: Self.notchHintIconVisibleKey)
         isNotchHintIconVisible = false
         NotchIslandController.shared.refreshWindowLayout()
@@ -176,11 +204,22 @@ final class DisplaySurfaceCoordinator: ObservableObject {
     }
 
     private static func isNotchHintIconVisiblePreference() -> Bool {
-        if UserDefaults.standard.object(forKey: notchHintIconVisibleKey) != nil {
-            return UserDefaults.standard.bool(forKey: notchHintIconVisibleKey)
+        !UserDefaults.standard.bool(forKey: notchHintHiddenByUserKey)
+    }
+
+    /// Clears legacy false defaults that hid the hint without an explicit user action.
+    private static func migrateNotchHintPreferenceIfNeeded() {
+        let defaults = UserDefaults.standard
+        let migrationKey = "bankirr.notchHintIconMigration.v1"
+        guard !defaults.bool(forKey: migrationKey) else { return }
+        defaults.set(true, forKey: migrationKey)
+
+        guard defaults.object(forKey: notchHintHiddenByUserKey) == nil else { return }
+        if defaults.object(forKey: notchHintIconVisibleKey) != nil,
+           !defaults.bool(forKey: notchHintIconVisibleKey) {
+            defaults.removeObject(forKey: notchHintIconVisibleKey)
         }
-        // Legacy key controlled menu bar extra, not the notch hint — default hint visible.
-        return true
+        defaults.set(true, forKey: notchHintIconVisibleKey)
     }
 
     private func menuBarItemFrame(on screen: NSScreen) -> CGRect {
