@@ -1155,8 +1155,8 @@ final class WalletStore: ObservableObject {
                 await self?.completeAuthFromToken(token)
             }
         }
-        workspaceActiveObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didBecomeActiveNotification,
+        workspaceActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -1175,7 +1175,7 @@ final class WalletStore: ObservableObject {
             NotificationCenter.default.removeObserver(authCallbackObserver)
         }
         if let workspaceActiveObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(workspaceActiveObserver)
+            NotificationCenter.default.removeObserver(workspaceActiveObserver)
         }
     }
 
