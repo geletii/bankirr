@@ -11,5 +11,3 @@ Recommended alternative:
 
 Build from source:
   https://github.com/geletii/bankirr
-
-Open source — read TRANSPARENCY.md in the repository for network and file access details.

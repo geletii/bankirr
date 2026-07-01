@@ -36,6 +36,8 @@ struct NotchIslandRootView: View {
     @State private var showAddWallet = false
     @State private var newWalletAddress = ""
     @State private var newWalletName = ""
+    @State private var showSubscriptionCodeEntry = false
+    @FocusState private var subscriptionCodeFieldFocused: Bool
 
     private var metrics: NotchMetrics {
         if let screen = NotchScreenGeometry.notchScreen {
@@ -114,7 +116,7 @@ struct NotchIslandRootView: View {
                 openDetails(source: "area")
             }
             .contextMenu {
-                NotchSettingsMenuItems(coordinator: coordinator)
+                NotchSettingsMenuItems(coordinator: coordinator, store: store, updater: updater)
             }
     }
 
@@ -145,7 +147,7 @@ struct NotchIslandRootView: View {
                 .padding(.top, max((metrics.notchHeight - 28) / 2, 4))
             }
             .contextMenu {
-                NotchSettingsMenuItems(coordinator: coordinator)
+                NotchSettingsMenuItems(coordinator: coordinator, store: store, updater: updater)
             }
         }
     }
@@ -189,6 +191,9 @@ struct NotchIslandRootView: View {
             amountLabel
             Color.clear.frame(width: 16, height: 16)
             Spacer(minLength: 4)
+            if updater.updateAvailable {
+                Color.clear.frame(width: 13, height: 13)
+            }
             Color.clear.frame(width: 8, height: 8)
         }
         .padding(.leading, 13)
@@ -204,6 +209,9 @@ struct NotchIslandRootView: View {
                 amountLabel.hidden()
                 pinButton
                 Spacer(minLength: 4)
+                if updater.updateAvailable {
+                    compactUpdateBadge
+                }
                 statusDot
             }
             .padding(.leading, 13)
@@ -257,10 +265,26 @@ struct NotchIslandRootView: View {
             .contentShape(Circle())
     }
 
+    private var compactUpdateBadge: some View {
+        Image(systemName: "arrow.down.circle.fill")
+            .font(.system(size: 11, weight: .bold))
+            .foregroundStyle(Color(red: 0.36, green: 0.91, blue: 0.47))
+            .shadow(color: Color(red: 0.36, green: 0.91, blue: 0.47).opacity(0.7), radius: 4)
+            .bankirrHelp("Update available — open Bankirr to install")
+    }
+
     // MARK: - Expanded
 
     private var expandedContent: some View {
         VStack(spacing: 10) {
+            if updater.updateAvailable {
+                notchUpdateBanner
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+            if store.accessState != .active {
+                notchSubscriptionBanner
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
             marketTickerBar
             refreshStatusBar
 
@@ -294,6 +318,246 @@ struct NotchIslandRootView: View {
                 statsWalletFilter = nil
             }
         }
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: updater.updateAvailable)
+        .animation(.easeInOut(duration: 0.2), value: updater.isUpdating)
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: store.accessState)
+    }
+
+    // MARK: - Update available banner
+
+    private var notchAccent: Color { Color(red: 0.36, green: 0.91, blue: 0.47) }
+
+    private var updateVersionLine: String {
+        if let latest = updater.latestVersion {
+            return "Version \(latest) is ready to install."
+        }
+        return "A new version is ready to install."
+    }
+
+    private var notchUpdateBanner: some View {
+        HStack(spacing: 11) {
+            ZStack {
+                Circle()
+                    .fill(notchAccent.opacity(0.16))
+                    .frame(width: 32, height: 32)
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(notchAccent)
+            }
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(updater.isUpdating ? "Updating Bankirr…" : "Update available")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                Text(updater.status ?? updateVersionLine)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+
+            Spacer(minLength: 6)
+
+            if updater.isUpdating {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(.white)
+            } else {
+                Button {
+                    updater.performUpdate()
+                } label: {
+                    Text("Update")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(notchAccent, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .bankirrHelp("Download and install the latest version")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [notchAccent.opacity(0.16), Color.white.opacity(0.05)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(notchAccent.opacity(0.32), lineWidth: 1)
+                )
+        )
+    }
+
+    // MARK: - Subscription / trial banner
+
+    private var notchSubscriptionBanner: some View {
+        let expired = store.accessState == .expired
+        let accent = expired ? Color(red: 1.0, green: 0.62, blue: 0.22) : Color(red: 0.55, green: 0.74, blue: 1.0)
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 11) {
+                ZStack {
+                    Circle()
+                        .fill(accent.opacity(0.16))
+                        .frame(width: 32, height: 32)
+                    Image(systemName: expired ? "exclamationmark.circle.fill" : "sparkles")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(accent)
+                }
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(expired ? "Subscription required" : "Free trial")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Text(store.trialStatusText)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                }
+
+                Spacer(minLength: 6)
+
+                Button {
+                    if let url = store.subscriptionURL {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    Text(store.subscriptionActionTitle)
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(accent, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .bankirrHelp("Get an activation code to keep using Bankirr")
+            }
+
+            notchSubscriptionCodeEntry(accent: accent)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [accent.opacity(0.15), Color.white.opacity(0.05)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(accent.opacity(0.3), lineWidth: 1)
+                )
+        )
+        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: showSubscriptionCodeEntry)
+    }
+
+    @ViewBuilder
+    private func notchSubscriptionCodeEntry(accent: Color) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+                .overlay(Color.white.opacity(0.08))
+
+            Button {
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                    showSubscriptionCodeEntry.toggle()
+                }
+                if showSubscriptionCodeEntry {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        subscriptionCodeFieldFocused = true
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "ticket.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("Already have a code?")
+                        .font(.system(size: 11, weight: .semibold))
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .rotationEffect(.degrees(showSubscriptionCodeEntry ? 180 : 0))
+                }
+                .foregroundStyle(accent)
+            }
+            .buttonStyle(.plain)
+            .bankirrHelp("Enter an activation code you already have")
+
+            if showSubscriptionCodeEntry {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 8) {
+                        TextField("Activation code", text: $store.subscriptionCode)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.white)
+                            .focused($subscriptionCodeFieldFocused)
+                            .autocorrectionDisabled(true)
+                            .onSubmit { activateNotchSubscriptionCode() }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .background(
+                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .fill(Color.black.opacity(0.35))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                            .stroke(accent.opacity(0.35), lineWidth: 1)
+                                    )
+                            )
+
+                        Button {
+                            activateNotchSubscriptionCode()
+                        } label: {
+                            Group {
+                                if store.authBusy {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .tint(.black)
+                                } else {
+                                    Text("Activate")
+                                        .font(.system(size: 12, weight: .bold))
+                                        .foregroundStyle(.black)
+                                }
+                            }
+                            .frame(minWidth: 30)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(accent.opacity(canActivateNotchCode ? 1 : 0.4), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!canActivateNotchCode)
+                        .bankirrHelp("Activate this Mac with your code")
+                    }
+
+                    if let message = store.authMessage, !message.isEmpty {
+                        Text(message)
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.7))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+    }
+
+    private var canActivateNotchCode: Bool {
+        !store.authBusy && !store.subscriptionCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func activateNotchSubscriptionCode() {
+        guard canActivateNotchCode else { return }
+        subscriptionCodeFieldFocused = false
+        Task { await store.activateSubscriptionCode() }
     }
 
     private var marketTickerBar: some View {
@@ -532,18 +796,27 @@ struct NotchIslandRootView: View {
 
     private var expandedSettingsButton: some View {
         Menu {
-            NotchSettingsMenuItems(coordinator: coordinator)
+            NotchSettingsMenuItems(coordinator: coordinator, store: store, updater: updater)
         } label: {
             Image(systemName: "gearshape")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.75))
                 .frame(width: 28, height: 28)
                 .background(.white.opacity(0.08), in: Circle())
+                .overlay(alignment: .topTrailing) {
+                    if updater.updateAvailable {
+                        Circle()
+                            .fill(notchAccent)
+                            .frame(width: 7, height: 7)
+                            .overlay(Circle().stroke(notchBlack, lineWidth: 1.5))
+                            .offset(x: 1, y: -1)
+                    }
+                }
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .bankirrHelp("Settings")
+        .bankirrHelp(updater.updateAvailable ? "Update available · Settings" : "Settings")
     }
 
     private func categoryButton(_ category: InsightCategory) -> some View {
@@ -902,8 +1175,69 @@ struct NotchIslandRootView: View {
 
 private struct NotchSettingsMenuItems: View {
     @ObservedObject var coordinator: DisplaySurfaceCoordinator
+    @ObservedObject var store: WalletStore
+    @ObservedObject var updater: UpdateManager
 
     var body: some View {
+        if updater.updateAvailable {
+            Button {
+                updater.performUpdate()
+            } label: {
+                Label(
+                    updater.isUpdating ? "Updating…" : "Update Bankirr",
+                    systemImage: "arrow.down.circle.fill"
+                )
+            }
+            .disabled(updater.isUpdating)
+
+            Divider()
+        }
+
+        if store.accessState != .active {
+            Button {
+                if let url = store.subscriptionURL {
+                    NSWorkspace.shared.open(url)
+                }
+            } label: {
+                Label(store.subscriptionActionTitle, systemImage: "sparkles")
+            }
+        }
+
+        if store.isAuthenticated {
+            Button {
+                store.logout()
+            } label: {
+                Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
+            }
+        } else {
+            Button {
+                if let url = store.signInURL {
+                    NSWorkspace.shared.open(url)
+                }
+            } label: {
+                Label("Sign in", systemImage: "person.crop.circle")
+            }
+            .disabled(store.authBusy)
+        }
+
+        Button {
+            if let url = BankirrConfig.dashboardURL {
+                NSWorkspace.shared.open(url)
+            }
+        } label: {
+            Label("Open dashboard", systemImage: "arrow.up.right.square")
+        }
+
+        Button {
+            if let url = URL(string: "mailto:\(SupportContactLink.email)?subject=Bankirr") {
+                NSWorkspace.shared.open(url)
+            }
+        } label: {
+            Label("Contact support", systemImage: "envelope")
+        }
+
+        Divider()
+
         if coordinator.surface == .notch {
             if coordinator.isNotchHintIconVisible {
                 Button {

@@ -118,7 +118,6 @@ private struct StatusBarRightClickDetector: NSViewRepresentable {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        BankirrToolTip.configure()
         registerAuthURLHandler()
     }
 
@@ -1107,6 +1106,7 @@ final class WalletStore: ObservableObject {
     private static let entitlementRenewalWatchInterval: TimeInterval = 3 * 60
     private static let entitlementApproachingWindow: TimeInterval = 24 * 3600
     private var authCallbackObserver: NSObjectProtocol?
+    private var workspaceActiveObserver: NSObjectProtocol?
     private var lastAuthTokenFingerprint: String?
     private var lastAuthTokenAt: Date?
     private var cachedDeviceEntitlement: EntitlementPayload?
@@ -1155,6 +1155,15 @@ final class WalletStore: ObservableObject {
                 await self?.completeAuthFromToken(token)
             }
         }
+        workspaceActiveObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.refreshEntitlement()
+            }
+        }
     }
 
     deinit {
@@ -1164,6 +1173,9 @@ final class WalletStore: ObservableObject {
         networkConditionsTask?.cancel()
         if let authCallbackObserver {
             NotificationCenter.default.removeObserver(authCallbackObserver)
+        }
+        if let workspaceActiveObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceActiveObserver)
         }
     }
 
@@ -1992,7 +2004,13 @@ final class WalletStore: ObservableObject {
                 print("Account entitlement refresh failed: \(error.localizedDescription)")
             }
         }
-        if !hadAccess, hasEntitlementAccess {
+        if hadAccess && !hasEntitlementAccess {
+            invalidateInFlightPortfolioRefresh()
+            snapshots = [:]
+            loadingStates = [:]
+            errors = [:]
+            saveWallets()
+        } else if !hadAccess, hasEntitlementAccess {
             await refreshAllWallets(manual: false)
         }
     }

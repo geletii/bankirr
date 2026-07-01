@@ -1,18 +1,4 @@
-import AppKit
 import SwiftUI
-
-enum BankirrToolTip {
-    static let showDelay: TimeInterval = 0
-
-    static func configure() {
-        guard
-            let managerClass = NSClassFromString("NSToolTipManager"),
-            let shared = (managerClass as AnyObject).perform?(Selector(("sharedToolTipManager")))?
-                .takeUnretainedValue() as? NSObject
-        else { return }
-        shared.setValue(showDelay, forKey: "initialToolTipDelay")
-    }
-}
 
 extension View {
     func bankirrHelp(_ text: String) -> some View {

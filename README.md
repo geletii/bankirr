@@ -1,8 +1,6 @@
 # Bankirr for macOS
 
-Open-source menu bar app for [bankirr.xyz](https://bankirr.xyz). Tracks wallet balances, lending, and liquidity pools via the public Bankirr API.
-
-This repository contains **only the Mac client**. The Bankirr server and website are not published here.
+Menu bar app for [bankirr.xyz](https://bankirr.xyz). Tracks wallet balances, lending, and liquidity pools via the Bankirr API.
 
 ## Install
 
