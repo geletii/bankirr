@@ -281,7 +281,7 @@ struct NotchIslandRootView: View {
                 notchUpdateBanner
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
-            if store.accessState != .active {
+            if store.accessState != .active || store.walletsNeedSubscription {
                 notchSubscriptionBanner
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
@@ -1268,6 +1268,18 @@ private struct NotchSettingsMenuItems: View {
 
             Divider()
         }
+
+        Button {
+            updater.checkForUpdatesManually()
+        } label: {
+            Label(
+                updater.isChecking ? "Checking for updates…" : "Check for updates",
+                systemImage: "arrow.clockwise"
+            )
+        }
+        .disabled(updater.isChecking || updater.isUpdating)
+
+        Divider()
 
         Button("Quit Bankirr") {
             NSApplication.shared.terminate(nil)

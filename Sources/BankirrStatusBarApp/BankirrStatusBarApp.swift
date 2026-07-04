@@ -15,18 +15,30 @@ extension Notification.Name {
 
 enum BankirrConfig {
     static let defaultWebBaseURL = "https://bankirr.xyz"
+    static let defaultAPIBaseURL = "https://api.bankirr.xyz"
 
+    private static func normalizeBase(_ value: String) -> String {
+        value.hasSuffix("/") ? String(value.dropLast()) : value
+    }
+
+    /// Web UI: dashboard, connect, manage, download/version.json (Cloudflare Pages).
     static var webBaseURL: String {
-        let env = ProcessInfo.processInfo.environment["BANKIRR_API_BASE_URL"]?
+        let env = ProcessInfo.processInfo.environment["BANKIRR_WEB_BASE_URL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let env, !env.isEmpty {
-            return env.hasSuffix("/") ? String(env.dropLast()) : env
-        }
+        if let env, !env.isEmpty { return normalizeBase(env) }
         return defaultWebBaseURL
     }
 
+    /// REST API (Railway). Override with BANKIRR_API_BASE_URL for local dev.
+    static var apiBaseURLString: String {
+        let env = ProcessInfo.processInfo.environment["BANKIRR_API_BASE_URL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let env, !env.isEmpty { return normalizeBase(env) }
+        return defaultAPIBaseURL
+    }
+
     static var apiBaseURL: URL {
-        URL(string: webBaseURL)!
+        URL(string: apiBaseURLString)!
     }
 
     static var hostLabel: String {
@@ -137,9 +149,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 @MainActor
 final class UpdateManager: ObservableObject {
+    enum UpdateCheckResult: Equatable {
+        case updateAvailable(latest: String)
+        case upToDate
+        case failed
+    }
+
     @Published private(set) var updateAvailable = false
     @Published private(set) var latestVersion: String?
     @Published private(set) var isUpdating = false
+    @Published private(set) var isChecking = false
     @Published private(set) var status: String?
 
     private let baseURL: String
@@ -169,18 +188,55 @@ final class UpdateManager: ObservableObject {
         }
     }
 
-    func check() async {
-        guard let url = URL(string: "\(baseURL)/download/version.json") else { return }
+    @discardableResult
+    func check() async -> UpdateCheckResult {
+        guard let url = URL(string: "\(baseURL)/download/version.json") else { return .failed }
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return }
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return .failed }
             let info = try JSONDecoder().decode(VersionInfo.self, from: data)
             latestVersion = info.version
             updateAvailable = Self.isNewer(info.version, than: currentVersion)
+            return updateAvailable ? .updateAvailable(latest: info.version) : .upToDate
         } catch {
-            // Silent: a failed update check should never disrupt the app.
+            // Silent: a failed background check should never disrupt the app.
+            return .failed
+        }
+    }
+
+    func checkForUpdatesManually() {
+        guard !isChecking, !isUpdating else { return }
+        isChecking = true
+        Task {
+            let result = await check()
+            isChecking = false
+            presentManualCheckAlert(result)
+        }
+    }
+
+    private func presentManualCheckAlert(_ result: UpdateCheckResult) {
+        let alert = NSAlert()
+        switch result {
+        case .updateAvailable(let latest):
+            alert.messageText = "Update available"
+            alert.informativeText = "Bankirr \(latest) is ready to install. You're on \(currentVersion)."
+            alert.addButton(withTitle: "Update")
+            alert.addButton(withTitle: "Later")
+            if alert.runModal() == .alertFirstButtonReturn {
+                performUpdate()
+            }
+        case .upToDate:
+            alert.messageText = "You're up to date"
+            alert.informativeText = "Bankirr \(currentVersion) is the latest version."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        case .failed:
+            alert.messageText = "Couldn't check for updates"
+            alert.informativeText = "Check your connection and try again."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
         }
     }
 
@@ -755,6 +811,10 @@ extension NSError {
     var isUnauthorizedAPIError: Bool {
         domain == "BankirrAPI" && code == 401
     }
+
+    var isPaymentRequiredAPIError: Bool {
+        domain == "BankirrAPI" && code == 402
+    }
 }
 
 struct BankirrAPIClient {
@@ -1308,7 +1368,19 @@ final class WalletStore: ObservableObject {
 
     private var effectiveAccountEntitlement: EntitlementPayload? {
         guard isAuthenticated else { return nil }
-        return entitlement ?? cachedAccountEntitlement
+        if let entitlement { return entitlement }
+        // Device license was revoked on the server — don't trust a stale cached account.
+        if let device = deviceEntitlement, !isEntitlementCurrentlyActive(device) {
+            return nil
+        }
+        return cachedAccountEntitlement
+    }
+
+    var walletsNeedSubscription: Bool {
+        errors.values.contains {
+            $0.localizedCaseInsensitiveContains("subscription required")
+                || $0.localizedCaseInsensitiveContains("trial or subscription")
+        }
     }
 
     private func isEntitlementCurrentlyActive(_ payload: EntitlementPayload?) -> Bool {
@@ -1737,6 +1809,14 @@ final class WalletStore: ObservableObject {
             }
         } catch is CancellationError {
             return
+        } catch let error as NSError where error.isPaymentRequiredAPIError {
+            await handleSubscriptionAccessDenied()
+            if manual {
+                let message = refreshErrorMessage(error)
+                for wallet in targetWallets {
+                    errors[wallet.id] = message
+                }
+            }
         } catch {
             if manual {
                 let message = refreshErrorMessage(error)
@@ -1745,6 +1825,28 @@ final class WalletStore: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Server denied portfolio access — drop stale cached "active" entitlements and resync.
+    private func handleSubscriptionAccessDenied() async {
+        let now = Int(Date().timeIntervalSince1970)
+        let expired = EntitlementPayload(
+            access: "expired",
+            reason: "access_denied",
+            expiresAt: now,
+            trialEndsAt: nil,
+            paymentLink: nil,
+            paypalLink: nil,
+            manageUrl: nil
+        )
+        deviceEntitlement = expired
+        cachedDeviceEntitlement = expired
+        if isAuthenticated {
+            entitlement = expired
+            cachedAccountEntitlement = expired
+        }
+        persistEntitlementCache()
+        await refreshEntitlement()
     }
 
     private static func matchSnapshot(for address: String, in snapshots: [String: WalletSnapshot]) -> WalletSnapshot? {
@@ -2020,6 +2122,12 @@ final class WalletStore: ObservableObject {
             let response = try await api.getDeviceSubscriptionStatus(deviceId: deviceId)
             deviceEntitlement = response.entitlement
             cachedDeviceEntitlement = response.entitlement
+            if !isEntitlementCurrentlyActive(response.entitlement) {
+                cachedAccountEntitlement = nil
+                if let account = entitlement, isEntitlementCurrentlyActive(account) {
+                    entitlement = nil
+                }
+            }
             persistEntitlementCache()
         } catch {
             print("Device entitlement refresh failed: \(error.localizedDescription)")
@@ -2367,7 +2475,7 @@ struct MenuBarContentView: View {
             SubscriptionGateView(store: store, openURL: openURL)
         } else if store.hasWallets {
             VStack(alignment: .leading, spacing: 10) {
-                if store.accessState != .active {
+                if store.accessState != .active || store.walletsNeedSubscription {
                     SubscriptionCTABanner(store: store, openURL: openURL)
                 }
 
@@ -2397,7 +2505,7 @@ struct MenuBarContentView: View {
                     .font(.headline)
                 TrialBadge(
                     text: store.trialStatusText,
-                    active: store.accessState == .active
+                    active: store.accessState == .active && !store.walletsNeedSubscription
                 )
             }
 
@@ -2407,7 +2515,7 @@ struct MenuBarContentView: View {
                 Task { await store.refreshAllWallets(manual: true) }
             }
 
-            MenuSettingsMenu(store: store, openURL: openURL)
+            MenuSettingsMenu(store: store, updater: updater, openURL: openURL)
         }
     }
 
@@ -2669,9 +2777,13 @@ struct SubscriptionCTABanner: View {
     let openURL: OpenURLAction
     @State private var showCodeEntry = false
 
+    private var showAsActive: Bool {
+        store.accessState == .active && !store.walletsNeedSubscription
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if store.accessState == .active {
+            if showAsActive {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Subscription active")
@@ -3168,10 +3280,21 @@ struct DailyChangePill: View {
 
 struct MenuSettingsMenu: View {
     @ObservedObject var store: WalletStore
+    @ObservedObject var updater: UpdateManager
     let openURL: OpenURLAction
+    @State private var showActivationCodeSheet = false
 
     var body: some View {
         Menu {
+            if updater.updateAvailable {
+                Button(updater.isUpdating ? "Updating…" : "Update Bankirr") {
+                    updater.performUpdate()
+                }
+                .disabled(updater.isUpdating)
+
+                Divider()
+            }
+
             if store.isAuthenticated {
                 Button("Sign out") {
                     store.logout()
@@ -3188,6 +3311,17 @@ struct MenuSettingsMenu: View {
                 guard let url = BankirrConfig.dashboardURL else { return }
                 openURL(url)
             }
+
+            Button("Enter activation code…") {
+                showActivationCodeSheet = true
+            }
+
+            Divider()
+
+            Button(updater.isChecking ? "Checking for updates…" : "Check for updates") {
+                updater.checkForUpdatesManually()
+            }
+            .disabled(updater.isChecking || updater.isUpdating)
 
             Divider()
 
@@ -3206,6 +3340,59 @@ struct MenuSettingsMenu: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .bankirrHelp("Account & settings")
+        .sheet(isPresented: $showActivationCodeSheet) {
+            ActivationCodeEntrySheet(store: store)
+        }
+    }
+}
+
+struct ActivationCodeEntrySheet: View {
+    @ObservedObject var store: WalletStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Enter activation code")
+                .font(.title3.bold())
+
+            Text("Paste the code from your email to activate this Mac.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                TextField("Activation code", text: $store.subscriptionCode)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+                Button(store.authBusy ? "…" : "Activate") {
+                    Task {
+                        await store.activateSubscriptionCode()
+                        if store.accessState == .active {
+                            dismiss()
+                        }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    store.authBusy
+                        || store.subscriptionCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
+            }
+
+            if let message = store.authMessage, !message.isEmpty {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 0)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
     }
 }
 

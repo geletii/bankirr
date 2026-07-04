@@ -4,14 +4,15 @@ This document lists every network connection, file write, and permission the men
 
 ## What the app does
 
-Bankirr is a read-only portfolio viewer. You add **public wallet addresses** (or ENS names). The native app fetches balances and market data **only from the Bankirr API** (`https://bankirr.xyz` by default). Portfolio math and external data sources (RPC, price feeds) run on the server, not inside the menu bar binary. The app does **not** ask for seed phrases, private keys, or transaction signing.
+Bankirr is a read-only portfolio viewer. You add **public wallet addresses** (or ENS names). The native app fetches balances and market data **from the Bankirr API** (`https://api.bankirr.xyz` by default). Portfolio math and external data sources (RPC, price feeds) run on the server, not inside the menu bar binary. The app does **not** ask for seed phrases, private keys, or transaction signing.
 
 ## Network connections
 
 | Destination | When | Data sent |
 |-------------|------|-----------|
-| Bankirr API (`https://bankirr.xyz` or `BANKIRR_API_BASE_URL`) | Auth, subscription, wallet sync, portfolio, ETH/gas market | JWT (after login), wallet addresses, device ID |
-| `{base}/download/version.json` and `{base}/download/Bankirr.zip` | In-app update only | None (download) |
+| Bankirr API (`https://api.bankirr.xyz` or `BANKIRR_API_BASE_URL`) | Auth, subscription, wallet sync, portfolio, ETH/gas market | JWT (after login), wallet addresses, device ID |
+| Bankirr web (`https://bankirr.xyz` or `BANKIRR_WEB_BASE_URL`) | In-app update, dashboard/connect/manage links | See below |
+| `{web}/download/version.json` and `{web}/download/Bankirr.zip` | In-app update only | None (download) |
 | `http://127.0.0.1:38473` | Browser sign-in handoff only | JWT in query string on localhost |
 | Bankirr web (`{base}/little/connect.html`, dashboard, pricing) | User opens links in the browser | Depends on page (sign-in, subscription) |
 
