@@ -32,6 +32,7 @@ struct NotchIslandRootView: View {
     @EnvironmentObject private var coordinator: DisplaySurfaceCoordinator
     @State private var selectedCategory: InsightCategory = .assets
     @State private var selectedEarningsPeriod: EarningsPeriod = .daily
+    @State private var holdingsFilter: HoldingsFilter = .all
     @State private var statsWalletFilter: UUID?
     @State private var showAddWallet = false
     @State private var newWalletAddress = ""
@@ -692,6 +693,37 @@ struct NotchIslandRootView: View {
         .bankirrHelp("Show stats for a specific wallet or all wallets combined")
     }
 
+    private var holdingsFilterMenu: some View {
+        Menu {
+            ForEach(HoldingsFilter.allCases) { filter in
+                Button {
+                    holdingsFilter = filter
+                } label: {
+                    if holdingsFilter == filter {
+                        Label(filter.label, systemImage: "checkmark")
+                    } else {
+                        Text(filter.label)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Text(holdingsFilter.label)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .lineLimit(1)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.45))
+            }
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize(horizontal: false, vertical: true)
+        .bankirrHelp("Filter wallet holdings by blue-chip tokens or other assets")
+    }
+
     private var statsWalletFilterLabel: String {
         guard let id = statsWalletFilter,
               let wallet = store.wallets.first(where: { $0.id == id }) else {
@@ -702,11 +734,13 @@ struct NotchIslandRootView: View {
     }
 
     private var categoryDisplayTotals: PortfolioTotals {
-        guard selectedCategory != .assets else { return store.totals }
-        guard let id = statsWalletFilter, let snapshot = store.snapshots[id] else {
-            return store.totals
+        if selectedCategory == .assets {
+            return store.holdingsTotals(filter: holdingsFilter)
         }
-        return PortfolioTotals(snapshot: snapshot)
+        if let id = statsWalletFilter, let snapshot = store.snapshots[id] {
+            return PortfolioTotals(snapshot: snapshot)
+        }
+        return store.totals
     }
 
     private var isCategoryStatsLoading: Bool {
@@ -891,6 +925,19 @@ struct NotchIslandRootView: View {
                             earningsRow(totals: categoryDisplayTotals, loading: loading)
                         }
                     }
+                }
+            }
+
+            if selectedCategory == .assets && !store.totals.tokenBalances.isEmpty {
+                Divider()
+                    .overlay(Color.white.opacity(0.12))
+
+                HStack {
+                    Text("Holdings filter")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.7))
+                    Spacer()
+                    holdingsFilterMenu
                 }
             }
 

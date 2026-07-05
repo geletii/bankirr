@@ -438,6 +438,7 @@ struct PortfolioTotals {
     let ethUsd: Double
     let netDaily: Double
     let healthFactor: Double?
+    let tokenBalances: [TokenBalance]
 
     init(
         assets: Double,
@@ -446,7 +447,8 @@ struct PortfolioTotals {
         liquidityPools: Double,
         ethUsd: Double,
         netDaily: Double,
-        healthFactor: Double?
+        healthFactor: Double?,
+        tokenBalances: [TokenBalance] = []
     ) {
         self.assets = assets
         self.lending = lending
@@ -455,6 +457,7 @@ struct PortfolioTotals {
         self.ethUsd = ethUsd
         self.netDaily = netDaily
         self.healthFactor = healthFactor
+        self.tokenBalances = tokenBalances
     }
 
     init(snapshot: WalletSnapshot) {
@@ -465,7 +468,8 @@ struct PortfolioTotals {
             liquidityPools: snapshot.liquidityPools,
             ethUsd: snapshot.ethUsd,
             netDaily: snapshot.netDaily,
-            healthFactor: snapshot.healthFactor
+            healthFactor: snapshot.healthFactor,
+            tokenBalances: snapshot.tokenBalances
         )
     }
 
@@ -518,6 +522,75 @@ enum StatusBarRiskColor: Equatable {
     case warning
 }
 
+enum TokenHoldingsTier: String, Codable, Hashable {
+    case blueChip = "blue_chip"
+    case other
+}
+
+struct TokenBalance: Codable, Hashable, Identifiable {
+    let network: String
+    let symbol: String
+    let balance: Double
+    let priceUsd: Double
+    let valueUsd: Double
+    let contractAddress: String?
+    let tier: TokenHoldingsTier?
+
+    var id: String {
+        "\(network)|\(contractAddress ?? symbol.lowercased())|\(symbol)"
+    }
+
+    var resolvedTier: TokenHoldingsTier {
+        if let tier { return tier }
+        return TokenHoldingsClassifier.isBlueChip(symbol: symbol) ? .blueChip : .other
+    }
+}
+
+enum HoldingsFilter: String, CaseIterable, Identifiable {
+    case all
+    case blueChip
+    case other
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .all: return "All"
+        case .blueChip: return "Blue chip"
+        case .other: return "Other"
+        }
+    }
+}
+
+enum TokenHoldingsClassifier {
+    private static let blueChipSymbols: Set<String> = [
+        "ETH", "WETH", "BNB", "WBNB", "POL", "MATIC", "WMATIC", "WPOL",
+        "WBTC", "BTC", "USDC", "USDT", "DAI", "USDE", "FRAX", "LUSD",
+        "STETH", "WSTETH", "CBETH", "RETH", "LINK", "AAVE", "UNI",
+    ]
+
+    static func isBlueChip(symbol: String) -> Bool {
+        blueChipSymbols.contains(symbol.uppercased())
+    }
+
+    static func filtered(_ balances: [TokenBalance], filter: HoldingsFilter) -> [TokenBalance] {
+        switch filter {
+        case .all:
+            return balances
+        case .blueChip:
+            return balances.filter { $0.resolvedTier == .blueChip }
+        case .other:
+            return balances.filter { $0.resolvedTier == .other }
+        }
+    }
+
+    static func assetsUsd(in balances: [TokenBalance], filter: HoldingsFilter, fallback: Double) -> Double {
+        let filtered = filtered(balances, filter: filter)
+        guard !filtered.isEmpty else { return fallback }
+        return filtered.reduce(0) { $0 + $1.valueUsd }
+    }
+}
+
 struct WalletSnapshot: Codable, Hashable {
     let assets: Double
     let lending: Double
@@ -528,6 +601,35 @@ struct WalletSnapshot: Codable, Hashable {
     let netDaily: Double
     let healthFactor: Double?
     let fetchedAt: Date
+    let tokenBalances: [TokenBalance]
+
+    init(
+        assets: Double,
+        lending: Double,
+        debt: Double,
+        liquidityPools: Double,
+        netWorth: Double,
+        ethUsd: Double,
+        netDaily: Double,
+        healthFactor: Double?,
+        fetchedAt: Date,
+        tokenBalances: [TokenBalance] = []
+    ) {
+        self.assets = assets
+        self.lending = lending
+        self.debt = debt
+        self.liquidityPools = liquidityPools
+        self.netWorth = netWorth
+        self.ethUsd = ethUsd
+        self.netDaily = netDaily
+        self.healthFactor = healthFactor
+        self.fetchedAt = fetchedAt
+        self.tokenBalances = tokenBalances
+    }
+
+    func holdingsUsd(filter: HoldingsFilter) -> Double {
+        TokenHoldingsClassifier.assetsUsd(in: tokenBalances, filter: filter, fallback: assets)
+    }
 
     var liquidationEthPrice: Double? {
         guard ethUsd > 0, let hf = healthFactor, hf.isFinite, hf > 0 else { return nil }
@@ -552,7 +654,18 @@ struct WalletRowViewModel: Identifiable, Hashable {
 
 struct PortfolioSnapshotPayload: Decodable {
     struct NativeAssets: Decodable {
+        struct BalanceRow: Decodable {
+            let network: String?
+            let symbol: String?
+            let balance: Double?
+            let priceUsd: Double?
+            let valueUsd: Double?
+            let contractAddress: String?
+            let tier: String?
+        }
+
         let assetsUsd: Double?
+        let balances: [BalanceRow]?
     }
     struct LendingBlock: Decodable {
         let assetsUsd: Double?
@@ -989,6 +1102,26 @@ struct BankirrAPIClient {
         let netDaily = payload.renderData?.netDaily ?? 0
         let healthFactor = payload.renderData?.healthFactor
         let fetchedAt = payload.fetchedAt.map { Date(timeIntervalSince1970: $0 / 1000) } ?? Date()
+        let tokenBalances = (payload.nativeAssets?.balances ?? []).compactMap { row -> TokenBalance? in
+            guard let symbol = row.symbol, !symbol.isEmpty else { return nil }
+            let valueUsd = row.valueUsd ?? 0
+            guard valueUsd > 0 else { return nil }
+            let tier: TokenHoldingsTier?
+            switch row.tier {
+            case "blue_chip": tier = .blueChip
+            case "other": tier = .other
+            default: tier = nil
+            }
+            return TokenBalance(
+                network: row.network ?? "Unknown",
+                symbol: symbol,
+                balance: row.balance ?? 0,
+                priceUsd: row.priceUsd ?? 0,
+                valueUsd: valueUsd,
+                contractAddress: row.contractAddress,
+                tier: tier
+            )
+        }
 
         return WalletSnapshot(
             assets: assets,
@@ -999,7 +1132,8 @@ struct BankirrAPIClient {
             ethUsd: ethUsd,
             netDaily: netDaily,
             healthFactor: healthFactor,
-            fetchedAt: fetchedAt
+            fetchedAt: fetchedAt,
+            tokenBalances: tokenBalances
         )
     }
 
@@ -1546,8 +1680,26 @@ final class WalletStore: ObservableObject {
             liquidityPools: values.reduce(0) { $0 + $1.liquidityPools },
             ethUsd: values.map(\.ethUsd).max() ?? 0,
             netDaily: values.reduce(0) { $0 + $1.netDaily },
-            healthFactor: finiteHealthFactors.isEmpty ? nil : finiteHealthFactors.min()
+            healthFactor: finiteHealthFactors.isEmpty ? nil : finiteHealthFactors.min(),
+            tokenBalances: values.flatMap(\.tokenBalances)
         )
+    }
+
+    func holdingsTotals(filter: HoldingsFilter) -> PortfolioTotals {
+        var base = totals
+        if !base.tokenBalances.isEmpty {
+            base = PortfolioTotals(
+                assets: TokenHoldingsClassifier.assetsUsd(in: base.tokenBalances, filter: filter, fallback: base.assets),
+                lending: base.lending,
+                debt: base.debt,
+                liquidityPools: base.liquidityPools,
+                ethUsd: base.ethUsd,
+                netDaily: base.netDaily,
+                healthFactor: base.healthFactor,
+                tokenBalances: TokenHoldingsClassifier.filtered(base.tokenBalances, filter: filter)
+            )
+        }
+        return base
     }
 
     var statusBarTitle: String {
