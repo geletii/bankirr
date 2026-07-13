@@ -435,6 +435,7 @@ struct PortfolioTotals {
     let lending: Double
     let debt: Double
     let liquidityPools: Double
+    let exchangeAssets: Double
     let ethUsd: Double
     let netDaily: Double
     let healthFactor: Double?
@@ -444,6 +445,7 @@ struct PortfolioTotals {
         lending: Double,
         debt: Double,
         liquidityPools: Double,
+        exchangeAssets: Double,
         ethUsd: Double,
         netDaily: Double,
         healthFactor: Double?
@@ -452,6 +454,7 @@ struct PortfolioTotals {
         self.lending = lending
         self.debt = debt
         self.liquidityPools = liquidityPools
+        self.exchangeAssets = exchangeAssets
         self.ethUsd = ethUsd
         self.netDaily = netDaily
         self.healthFactor = healthFactor
@@ -463,6 +466,8 @@ struct PortfolioTotals {
             lending: snapshot.lending,
             debt: snapshot.debt,
             liquidityPools: snapshot.liquidityPools,
+            exchangeAssets: snapshot.netWorth -
+                (snapshot.assets + snapshot.lending + snapshot.liquidityPools - snapshot.debt),
             ethUsd: snapshot.ethUsd,
             netDaily: snapshot.netDaily,
             healthFactor: snapshot.healthFactor
@@ -470,7 +475,7 @@ struct PortfolioTotals {
     }
 
     var netWorth: Double {
-        assets + lending + liquidityPools - debt
+        assets + lending + liquidityPools + exchangeAssets - debt
     }
 
     var netMonthly: Double {
@@ -1544,6 +1549,9 @@ final class WalletStore: ObservableObject {
             lending: values.reduce(0) { $0 + $1.lending },
             debt: values.reduce(0) { $0 + $1.debt },
             liquidityPools: values.reduce(0) { $0 + $1.liquidityPools },
+            exchangeAssets: values.reduce(0) {
+                $0 + $1.netWorth - ($1.assets + $1.lending + $1.liquidityPools - $1.debt)
+            },
             ethUsd: values.map(\.ethUsd).max() ?? 0,
             netDaily: values.reduce(0) { $0 + $1.netDaily },
             healthFactor: finiteHealthFactors.isEmpty ? nil : finiteHealthFactors.min()

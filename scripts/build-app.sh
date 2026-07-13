@@ -49,11 +49,25 @@ fi
 
 chmod +x "$APP_DIR/Contents/MacOS/$BINARY_NAME"
 
-# Ad-hoc code signature (free, no Apple Developer account needed).
-# Required so Apple Silicon will run a universal binary that we assembled by hand.
-# To switch to a real Developer ID later, replace `-` with your identity, e.g.:
-#   codesign --force --deep --options runtime --sign "Developer ID Application: NAME (TEAMID)" "$APP_DIR"
-codesign --force --deep --sign - --timestamp=none "$APP_DIR"
+# Code signature. Default: ad-hoc (`-`), no Apple Developer account needed.
+# For distribution, set SIGN_IDENTITY to your Developer ID Application, e.g.:
+#   export SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+
+# Strip extended attributes that can break codesign after manual bundle assembly.
+xattr -cr "$APP_DIR"
+
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+  codesign --force --deep --sign - --timestamp=none "$APP_DIR"
+  SIGN_LABEL="ad-hoc signed"
+else
+  codesign --force --deep --options runtime \
+    --sign "$SIGN_IDENTITY" \
+    --timestamp \
+    "$APP_DIR"
+  SIGN_LABEL="signed with $SIGN_IDENTITY"
+fi
+
 codesign --verify --deep --strict "$APP_DIR"
 
-echo "Built $APP_DIR (universal: arm64 + x86_64, ad-hoc signed)"
+echo "Built $APP_DIR (universal: arm64 + x86_64, $SIGN_LABEL)"
