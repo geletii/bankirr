@@ -224,20 +224,36 @@ final class UpdateManager: ObservableObject {
             alert.informativeText = "Bankirr \(latest) is ready to install. You're on \(currentVersion)."
             alert.addButton(withTitle: "Update")
             alert.addButton(withTitle: "Later")
-            if alert.runModal() == .alertFirstButtonReturn {
+            if runAlertAboveNotch(alert) == .alertFirstButtonReturn {
                 performUpdate()
             }
         case .upToDate:
             alert.messageText = "You're up to date"
             alert.informativeText = "Bankirr \(currentVersion) is the latest version."
             alert.addButton(withTitle: "OK")
-            alert.runModal()
+            runAlertAboveNotch(alert)
         case .failed:
             alert.messageText = "Couldn't check for updates"
             alert.informativeText = "Check your connection and try again."
             alert.addButton(withTitle: "OK")
-            alert.runModal()
+            runAlertAboveNotch(alert)
         }
+    }
+
+    /// Runs an alert so it's actually visible and clickable from this
+    /// LSUIElement/notch app. The notch panel sits at `.statusBar + 1`, so a
+    /// default modal opens *behind* it, and because the app isn't active it never
+    /// takes focus — leaving a modal loop running against an invisible dialog that
+    /// freezes the whole screen. Activate the app and raise the alert window above
+    /// the notch before running the modal.
+    @discardableResult
+    private func runAlertAboveNotch(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        NSApp.activate(ignoringOtherApps: true)
+        let window = alert.window
+        window.level = .statusBar + 2
+        window.collectionBehavior.insert(.canJoinAllSpaces)
+        window.makeKeyAndOrderFront(nil)
+        return alert.runModal()
     }
 
     func performUpdate() {
