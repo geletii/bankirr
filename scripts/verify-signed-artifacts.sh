@@ -45,7 +45,10 @@ if ! codesign --verify --deep --strict "$APP_DIR" 2>/dev/null; then
   exit 1
 fi
 
-if ! codesign -dv --verbose=2 "$APP_DIR" 2>&1 | grep -q "Authority=Developer ID Application"; then
+# Capture first: `grep -q` closes the pipe early, codesign gets SIGPIPE (141),
+# and with `set -o pipefail` the whole check looks like a signing failure.
+codesign_info="$(codesign -dv --verbose=2 "$APP_DIR" 2>&1 || true)"
+if ! grep -q "Authority=Developer ID Application" <<<"$codesign_info"; then
   echo "App is not signed with Developer ID Application: $APP_DIR" >&2
   exit 1
 fi
