@@ -549,6 +549,8 @@ struct WalletSnapshot: Codable, Hashable {
     let netDaily: Double
     let healthFactor: Double?
     let fetchedAt: Date
+    /// Resolved 0x… when the payload included it. ENS + hex of one wallet share this.
+    let resolvedAddress: String?
 
     var liquidationEthPrice: Double? {
         guard ethUsd > 0, let hf = healthFactor, hf.isFinite, hf > 0 else { return nil }
@@ -598,6 +600,7 @@ struct PortfolioSnapshotPayload: Decodable {
     let market: Market?
     let renderData: RenderData?
     let fetchedAt: Double?
+    let address: String?
 }
 
 struct BatchPortfolioResponse: Decodable {
@@ -615,6 +618,19 @@ struct BatchPortfolioResponse: Decodable {
 
     let market: Market?
     let results: [String: Entry]
+}
+
+/// The cheap "did anything change" probe. A wallet's snapshot is 6–75 KB; its
+/// version is a number that moves on every accepted write and every on-chain
+/// invalidation, so the auto-refresh tick can ask this first and skip the
+/// payload entirely when nothing happened.
+struct PortfolioVersionsResponse: Decodable {
+    struct Entry: Decodable {
+        let version: Int
+        let updatedAt: Double?
+    }
+
+    let versions: [String: Entry]
 }
 
 struct MarketAPIResponse: Decodable {
@@ -688,12 +704,20 @@ struct ActivateSubscriptionCodeResponse: Decodable {
     let ok: Bool
     let user: BankirrUser?
     let entitlement: EntitlementPayload
+    let deviceSecret: String?
 }
 
 struct RedeemSubscriptionResponse: Decodable {
     let ok: Bool
     let user: BankirrUser?
     let entitlement: EntitlementPayload
+    let deviceSecret: String?
+}
+
+struct DeviceBindResponse: Decodable {
+    let ok: Bool
+    let bound: Bool?
+    let deviceSecret: String?
 }
 
 struct DeviceStatusResponse: Decodable {
@@ -785,6 +809,41 @@ enum TokenStore {
         ]
         SecItemDelete(query as CFDictionary)
         UserDefaults.standard.set(true, forKey: legacyKeychainPurgedKey)
+    }
+}
+
+/// Anonymous device id + API-issued secret. The UUID is an identifier; the
+/// secret is the credential sent as `X-Device-Secret`.
+enum DeviceIdentity {
+    private static let idKey = "bankirr.statusbar.deviceId.v1"
+    private static let secretKey = "bankirr.statusbar.deviceSecret.v1"
+
+    static var deviceId: String {
+        if let existing = UserDefaults.standard.string(forKey: idKey), !existing.isEmpty {
+            return existing
+        }
+        let created = UUID().uuidString
+        UserDefaults.standard.set(created, forKey: idKey)
+        return created
+    }
+
+    static var deviceSecret: String? {
+        get {
+            let value = UserDefaults.standard.string(forKey: secretKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (value?.isEmpty == false) ? value : nil
+        }
+        set {
+            if let newValue, !newValue.isEmpty {
+                UserDefaults.standard.set(newValue, forKey: secretKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: secretKey)
+            }
+        }
+    }
+
+    static func rememberSecret(_ secret: String?) {
+        guard let secret, !secret.isEmpty else { return }
+        deviceSecret = secret
     }
 }
 
@@ -902,12 +961,14 @@ struct BankirrAPIClient {
     }
 
     func activateSubscriptionCode(token: String, code: String, deviceId: String) async throws -> ActivateSubscriptionCodeResponse {
-        try await send(
+        let response: ActivateSubscriptionCodeResponse = try await send(
             path: "/api/subscription/activate-code",
             method: "POST",
             token: token,
             body: ["code": code, "deviceId": deviceId]
         )
+        DeviceIdentity.rememberSecret(response.deviceSecret)
+        return response
     }
 
     func redeemSubscriptionCode(code: String, deviceId: String, email: String?) async throws -> RedeemSubscriptionResponse {
@@ -915,11 +976,24 @@ struct BankirrAPIClient {
         if let email, !email.isEmpty {
             body["email"] = email
         }
-        return try await send(
+        let response: RedeemSubscriptionResponse = try await send(
             path: "/api/subscription/redeem",
             method: "POST",
             body: body
         )
+        DeviceIdentity.rememberSecret(response.deviceSecret)
+        return response
+    }
+
+    func bindDeviceSecret(token: String, deviceId: String) async throws -> DeviceBindResponse {
+        let response: DeviceBindResponse = try await send(
+            path: "/api/subscription/device-bind",
+            method: "POST",
+            token: token,
+            body: ["deviceId": deviceId]
+        )
+        DeviceIdentity.rememberSecret(response.deviceSecret)
+        return response
     }
 
     func getDeviceSubscriptionStatus(deviceId: String) async throws -> DeviceStatusResponse {
@@ -933,6 +1007,51 @@ struct BankirrAPIClient {
             gasGwei: response.gasGwei,
             transferGasUsd: response.transferGasUsd
         )
+    }
+
+    /// Snapshot versions keyed by the lowercased address we asked for. Wallets the
+    /// server has never stored are simply absent — the caller reads that as
+    /// "unknown", which means fetch.
+    func getPortfolioVersions(
+        token: String?,
+        deviceId: String,
+        addresses: [String],
+        timeout: TimeInterval = 20
+    ) async throws -> [String: Int] {
+        guard !addresses.isEmpty else { return [:] }
+
+        var components = URLComponents(
+            url: baseURL.appendingPathComponent("api/portfolio/v2/versions"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [
+            URLQueryItem(name: "addresses", value: addresses.joined(separator: ",")),
+            URLQueryItem(name: "deviceId", value: deviceId)
+        ]
+        guard let url = components?.url else {
+            throw NSError(domain: "BankirrAPI", code: -1, userInfo: [NSLocalizedDescriptionKey: "Bad versions URL"])
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyDeviceAuth(&request)
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw NSError(domain: "BankirrAPI", code: -1, userInfo: [NSLocalizedDescriptionKey: "No HTTP response"])
+        }
+        if !(200...299).contains(http.statusCode) {
+            let message = parseErrorMessage(from: data) ?? "API error \(http.statusCode)"
+            throw NSError(domain: "BankirrAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+
+        let decoded = try JSONDecoder().decode(PortfolioVersionsResponse.self, from: data)
+        return decoded.versions.reduce(into: [:]) { $0[$1.key.lowercased()] = $1.value.version }
     }
 
     func getPortfolioBatch(
@@ -967,6 +1086,7 @@ struct BankirrAPIClient {
         // Server-side aggregation can take ~60s on a cold cache with multiple wallets.
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyDeviceAuth(&request)
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
@@ -1020,7 +1140,8 @@ struct BankirrAPIClient {
             ethUsd: ethUsd,
             netDaily: netDaily,
             healthFactor: healthFactor,
-            fetchedAt: fetchedAt
+            fetchedAt: fetchedAt,
+            resolvedAddress: payload.address
         )
     }
 
@@ -1036,6 +1157,7 @@ struct BankirrAPIClient {
         request.httpMethod = method
         request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyDeviceAuth(&request)
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
@@ -1053,6 +1175,14 @@ struct BankirrAPIClient {
             throw NSError(domain: "BankirrAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: message])
         }
         return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    private func applyDeviceAuth(_ request: inout URLRequest) {
+        request.setValue("mac", forHTTPHeaderField: "X-Bankirr-Client")
+        request.setValue(DeviceIdentity.deviceId, forHTTPHeaderField: "X-Device-Id")
+        if let secret = DeviceIdentity.deviceSecret {
+            request.setValue(secret, forHTTPHeaderField: "X-Device-Secret")
+        }
     }
 
     private func parseErrorMessage(from data: Data) -> String? {
@@ -1165,18 +1295,24 @@ final class WalletStore: ObservableObject {
     @Published var authBusy = false
     @Published var authMessage: String?
     @Published private(set) var networkConditions = NetworkMarketConditions()
+    @Published var showRealValueNotice = false
 
     private let storageURL: URL
-    private let deviceIdStorageKey = "bankirr.statusbar.deviceId.v1"
     private let localTrialStartedAtKey = "bankirr.statusbar.localTrialStartedAt.v1"
+    private let realValueNoticeSeenKey = "bankirr.realValueNoticeSeen.v1"
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let api = BankirrAPIClient.makeDefault()
     private var didCheckInitialLaunch = false
     private var autoRefreshTask: Task<Void, Never>?
     private var entitlementRefreshTask: Task<Void, Never>?
-    private var walletRefreshTask: Task<Void, Never>?
+    /// Carries the refresh's "did a snapshot land" answer, so a manual refresh
+    /// stays cancellable while still reporting its result to the caller.
+    private var walletRefreshTask: Task<Bool, Never>?
     private var networkConditionsTask: Task<Void, Never>?
+    /// Lowercased address → the snapshot version behind what is on screen. Kept
+    /// in memory only: a relaunch starts blank, which just means one full refresh.
+    private var lastSeenVersions: [String: Int] = [:]
     private static let manualRefreshTimeout: TimeInterval = 45
     private static let backgroundRefreshTimeout: TimeInterval = 180
     /// Background entitlement polling when subscription is far from expiry.
@@ -1266,8 +1402,47 @@ final class WalletStore: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 120_000_000_000)
                 guard let self, !Task.isCancelled else { break }
-                await self.refreshAllWallets(manual: false)
+                await self.refreshChangedWallets()
             }
+        }
+    }
+
+    /// The background tick. It used to pull every wallet's full snapshot every two
+    /// minutes whether or not anything had happened — 6–75 KB per wallet, mostly
+    /// to re-render the same number. Now it asks the server for versions first
+    /// (tens of bytes) and only pays for the payload when one actually moved.
+    ///
+    /// Anything unclear counts as changed: a wallet the server has no row for, a
+    /// version we have not seen, or a failed probe all fall through to the full
+    /// refresh. The optimisation may cost an extra request; it must never cost a
+    /// missed update.
+    private func refreshChangedWallets() async {
+        guard hasEntitlementAccess else { return }
+        let addresses = wallets.map(\.address)
+        guard !addresses.isEmpty else { return }
+
+        do {
+            let versions = try await api.getPortfolioVersions(
+                token: authToken(),
+                deviceId: deviceId,
+                addresses: addresses
+            )
+            guard !Task.isCancelled else { return }
+            let changed = addresses.contains { address in
+                let key = address.lowercased()
+                guard let version = versions[key] else { return true } // nothing stored yet
+                return lastSeenVersions[key] != version
+            }
+            guard changed else { return }
+            if await refreshAllWallets(manual: false) {
+                // Recorded only after the payload actually landed, so a failed or
+                // partial refresh is retried on the next tick instead of being
+                // silently marked as seen.
+                lastSeenVersions = versions
+            }
+        } catch {
+            // The probe is an optimisation, not a gate.
+            await refreshAllWallets(manual: false)
         }
     }
 
@@ -1466,14 +1641,7 @@ final class WalletStore: ObservableObject {
         return AccessState(rawValue: raw)
     }
 
-    var deviceId: String {
-        if let existing = UserDefaults.standard.string(forKey: deviceIdStorageKey), !existing.isEmpty {
-            return existing
-        }
-        let created = UUID().uuidString
-        UserDefaults.standard.set(created, forKey: deviceIdStorageKey)
-        return created
-    }
+    var deviceId: String { DeviceIdentity.deviceId }
 
     var webBaseURL: String { BankirrConfig.webBaseURL }
 
@@ -1558,7 +1726,13 @@ final class WalletStore: ObservableObject {
     }
 
     var totals: PortfolioTotals {
-        let values = wallets.compactMap { snapshots[$0.id] }
+        var seen = Set<String>()
+        let values: [WalletSnapshot] = wallets.compactMap { wallet in
+            guard let snap = snapshots[wallet.id] else { return nil }
+            let identity = (snap.resolvedAddress ?? wallet.address).lowercased()
+            guard seen.insert(identity).inserted else { return nil }
+            return snap
+        }
         let finiteHealthFactors = values.compactMap(\.healthFactor).filter { $0.isFinite && $0 > 0 }
         return PortfolioTotals(
             assets: values.reduce(0) { $0 + $1.assets },
@@ -1601,6 +1775,17 @@ final class WalletStore: ObservableObject {
 
     func dismissOnboarding() {
         shouldPresentOnboarding = false
+    }
+
+    func dismissRealValueNotice() {
+        UserDefaults.standard.set(true, forKey: realValueNoticeSeenKey)
+        showRealValueNotice = false
+    }
+
+    private func maybePromptRealValueNotice() {
+        guard !UserDefaults.standard.bool(forKey: realValueNoticeSeenKey) else { return }
+        guard hasWallets, !snapshots.isEmpty else { return }
+        showRealValueNotice = true
     }
 
     /// On a fresh app launch, show onboarding when no wallets are loaded yet.
@@ -1738,35 +1923,38 @@ final class WalletStore: ObservableObject {
         deleteWallets(at: IndexSet(integer: index))
     }
 
-    func refreshAllWallets(manual: Bool = true) async {
+    /// Returns whether a snapshot actually landed — the version-gated tick uses it
+    /// to decide if it may record what it has seen.
+    @discardableResult
+    func refreshAllWallets(manual: Bool = true) async -> Bool {
         if !hasEntitlementAccess {
             if manual {
                 authMessage = "Trial expired. Activate subscription to refresh balances."
             }
-            return
+            return false
         }
 
         let ids = Set(wallets.map(\.id))
-        guard !ids.isEmpty else { return }
+        guard !ids.isEmpty else { return false }
 
         if manual {
             walletRefreshTask?.cancel()
             let task = Task { @MainActor [weak self] in
-                guard let self else { return }
-                await self.refreshWallets(ids: ids, manual: true)
+                guard let self else { return false }
+                return await self.refreshWallets(ids: ids, manual: true)
             }
             walletRefreshTask = task
-            await task.value
-            return
+            return await task.value
         }
 
-        await refreshWallets(ids: ids, manual: false)
+        return await refreshWallets(ids: ids, manual: false)
     }
 
-    private func refreshWallets(ids: Set<UUID>, manual: Bool) async {
+    @discardableResult
+    private func refreshWallets(ids: Set<UUID>, manual: Bool) async -> Bool {
         pruneOrphanSnapshots()
         let targetWallets = wallets.filter { ids.contains($0.id) }
-        guard !targetWallets.isEmpty else { return }
+        guard !targetWallets.isEmpty else { return false }
 
         let isFullRefresh = ids.count == wallets.count
         if isFullRefresh {
@@ -1803,8 +1991,8 @@ final class WalletStore: ObservableObject {
                 forceRefresh: manual,
                 timeout: timeout
             )
-            guard !Task.isCancelled else { return }
-            guard listGeneration == portfolioListGeneration else { return }
+            guard !Task.isCancelled else { return false }
+            guard listGeneration == portfolioListGeneration else { return false }
 
             if let market = batch.market {
                 applyNetworkConditions(market, source: "portfolioBatch")
@@ -1830,9 +2018,13 @@ final class WalletStore: ObservableObject {
                 if manual, Self.isTransientNetworkMessage(authMessage) {
                     authMessage = nil
                 }
+                if isFullRefresh {
+                    maybePromptRealValueNotice()
+                }
             }
+            return didUpdateSnapshot
         } catch is CancellationError {
-            return
+            return false
         } catch let error as NSError where error.isPaymentRequiredAPIError {
             await handleSubscriptionAccessDenied()
             if manual {
@@ -1841,6 +2033,7 @@ final class WalletStore: ObservableObject {
                     errors[wallet.id] = message
                 }
             }
+            return false
         } catch {
             if manual {
                 let message = refreshErrorMessage(error)
@@ -1848,6 +2041,7 @@ final class WalletStore: ObservableObject {
                     errors[wallet.id] = message
                 }
             }
+            return false
         }
     }
 
@@ -2128,6 +2322,9 @@ final class WalletStore: ObservableObject {
                 persistEntitlementCache()
             } catch {
                 print("Account entitlement refresh failed: \(error.localizedDescription)")
+            }
+            if TokenStore.get() != nil, DeviceIdentity.deviceSecret == nil {
+                _ = try? await api.bindDeviceSecret(token: token, deviceId: deviceId)
             }
         }
         if hadAccess && !hasEntitlementAccess {
@@ -2464,6 +2661,45 @@ struct UpdateBanner: View {
     }
 }
 
+struct RealValueNoticeBanner: View {
+    var onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "info.circle.fill")
+                .foregroundStyle(.tint.opacity(0.85))
+                .font(.subheadline)
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Real market value only")
+                    .font(.subheadline.weight(.semibold))
+                Text("Bankirr shows only assets you could sell at roughly the shown price. Totals may differ from other trackers.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(6)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(10)
+        .background(.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(.tint.opacity(0.18), lineWidth: 1)
+        )
+    }
+}
+
 struct MenuBarContentView: View {
     @ObservedObject var store: WalletStore
     @ObservedObject var updater: UpdateManager
@@ -2501,6 +2737,10 @@ struct MenuBarContentView: View {
             VStack(alignment: .leading, spacing: 10) {
                 if store.accessState != .active || store.walletsNeedSubscription {
                     SubscriptionCTABanner(store: store, openURL: openURL)
+                }
+
+                if store.showRealValueNotice {
+                    RealValueNoticeBanner { store.dismissRealValueNotice() }
                 }
 
                 headerBar
